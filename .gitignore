@@ -1,0 +1,18 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Credenciales / secretos (NUNCA subir a GitHub) ---
+serviceAccount.json
+*serviceAccount*.json
+.env
+
+# --- Sistema operativo / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
