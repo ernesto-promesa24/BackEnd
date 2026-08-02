@@ -90,6 +90,13 @@ def salud():
 # ---------------------------------------------------------------------------
 # Catálogos fijos (gravedades, tipos de servicio, etc.)
 # ---------------------------------------------------------------------------
+def _opciones_catalogo(nombre):
+    """Opciones de fábrica del catálogo más las que se hayan agregado desde
+    el formulario de clientes, ya sin duplicados."""
+    return ut.combinar_opciones(ut.OPCIONES_BASE[nombre],
+                                fdb.listar_opciones_catalogo(nombre))
+
+
 @app.get("/api/catalogos")
 def catalogos():
     return jsonify({
@@ -98,11 +105,42 @@ def catalogos():
         "descripcion_gravedad": ut.DESCRIPCION_GRAVEDAD,
         "tipos_servicio": ut.TIPOS_SERVICIO,
         "resultados": ut.RESULTADOS_SERVICIO,
-        "categorias": ut.CATEGORIAS,
-        "estados": ut.ESTADOS,
-        "frecuencias": ut.FRECUENCIAS,
+        "categorias": _opciones_catalogo("categorias"),
+        "estados": _opciones_catalogo("estados"),
+        "frecuencias": _opciones_catalogo("frecuencias"),
         "tipos_reporte": rep.TIPOS_REPORTE,
     })
+
+
+@app.post("/api/catalogos/<nombre>/opciones")
+def post_opcion_catalogo(nombre):
+    """Agrega una opción a Categoría, Estado o Frecuencia.
+
+    Queda guardada y disponible para todos los registros siguientes. Si la
+    opción ya existía —aunque se haya escrito con otras mayúsculas, acentos o
+    espacios— no se duplica: se devuelve la que ya estaba.
+    """
+    if nombre not in ut.OPCIONES_BASE:
+        return jsonify({"error": f"El catálogo '{nombre}' no admite opciones nuevas."}), 404
+
+    valor = ut.limpiar_texto((request.get_json(force=True) or {}).get("valor"))
+    if not valor:
+        return jsonify({"error": "Escribe el nombre de la nueva opción."}), 400
+
+    actuales = _opciones_catalogo(nombre)
+    clave = ut.clave_opcion(valor)
+    for existente in actuales:
+        if ut.clave_opcion(existente) == clave:
+            return jsonify({
+                "valor": existente, "creada": False, "valores": actuales,
+                "mensaje": f"«{existente}» ya estaba en la lista; se usará esa.",
+            })
+
+    fdb.agregar_opcion_catalogo(nombre, valor)
+    return jsonify({
+        "valor": valor, "creada": True, "valores": _opciones_catalogo(nombre),
+        "mensaje": f"«{valor}» quedó guardada para futuros registros.",
+    }), 201
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +163,34 @@ def post_cliente():
     datos["nombre"] = nombre
     cliente_id = fdb.crear_cliente(datos)
     return jsonify({"id": cliente_id, "mensaje": f"Cliente '{nombre}' dado de alta."}), 201
+
+
+@app.put("/api/clientes/<cliente_id>")
+def put_cliente(cliente_id):
+    """Corrige los datos de un cliente ya registrado.
+
+    Los datos del cliente están copiados dentro de cada servicio y de cada
+    incidencia (así el dashboard lee una sola colección), de modo que al
+    corregirlos aquí también se refrescan allá.
+    """
+    datos = request.get_json(force=True)
+    nombre = ut.limpiar_texto(datos.get("nombre"))
+    if not nombre:
+        return jsonify({"error": "El nombre del cliente es obligatorio."}), 400
+    if fdb.existe_cliente_con_nombre(nombre, excluir_id=cliente_id):
+        return jsonify({"error": "Ya existe otro cliente con ese nombre."}), 409
+
+    datos["nombre"] = nombre
+    try:
+        actualizados = fdb.actualizar_cliente(cliente_id, datos)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 404
+
+    return jsonify({
+        "id": cliente_id,
+        "registros_actualizados": actualizados,
+        "mensaje": f"Cliente '{nombre}' actualizado.",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -186,21 +252,46 @@ def get_incidencias():
     return jsonify(incidencias)
 
 
+def _validar_incidencia(datos):
+    """Comprueba lo obligatorio y limpia los textos. Devuelve el mensaje de
+    error, o None si todo está bien."""
+    if not datos.get("servicio_id") or not datos.get("tipo_incidencia_id"):
+        return "El servicio y el tipo son obligatorios."
+
+    for campo in ("comentarios", "descripcion", "accion_correctiva",
+                  "material_pendiente"):
+        datos[campo] = ut.limpiar_texto(datos.get(campo))
+    return None
+
+
 @app.post("/api/incidencias")
 def post_incidencia():
     datos = request.get_json(force=True)
-    if not datos.get("servicio_id") or not datos.get("tipo_incidencia_id"):
-        return jsonify({"error": "El servicio y el tipo son obligatorios."}), 400
+    error = _validar_incidencia(datos)
+    if error:
+        return jsonify({"error": error}), 400
 
-    datos["comentarios"] = ut.limpiar_texto(datos.get("comentarios"))
-    datos["descripcion"] = ut.limpiar_texto(datos.get("descripcion"))
-    datos["accion_correctiva"] = ut.limpiar_texto(datos.get("accion_correctiva"))
-    datos["material_pendiente"] = ut.limpiar_texto(datos.get("material_pendiente"))
     try:
         incidencia_id = fdb.crear_incidencia(datos)
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     return jsonify({"id": incidencia_id, "mensaje": "Incidencia guardada."}), 201
+
+
+@app.put("/api/incidencias/<incidencia_id>")
+def put_incidencia(incidencia_id):
+    """Corrige una incidencia ya registrada, sin crear un registro nuevo.
+    Las evidencias que ya se subieron se conservan."""
+    datos = request.get_json(force=True)
+    error = _validar_incidencia(datos)
+    if error:
+        return jsonify({"error": error}), 400
+
+    try:
+        fdb.actualizar_incidencia(incidencia_id, datos)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"id": incidencia_id, "mensaje": "Incidencia actualizada."})
 
 
 @app.post("/api/incidencias/<incidencia_id>/resolver")

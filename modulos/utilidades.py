@@ -48,6 +48,16 @@ FRECUENCIAS = ["Semanal", "Quincenal", "Mensual", "Bimestral", "Trimestral",
                "2 veces por semana", "3 veces por semana", "6 veces por semana",
                "Sin recolección", "Sin definir"]
 
+# Catálogos que el usuario puede ampliar desde el formulario de clientes con
+# la opción «+ Agregar nueva opción». Las listas de arriba son la base que
+# siempre está disponible; lo que se agregue se guarda en Firestore y se une
+# a esa base cada vez que se piden los catálogos (ver combinar_opciones).
+OPCIONES_BASE = {
+    "categorias": CATEGORIAS,
+    "estados": ESTADOS,
+    "frecuencias": FRECUENCIAS,
+}
+
 # Clientes prioritarios: se les cobra por recolección, así que una segunda
 # vuelta por material olvidado NO se les puede volver a cobrar (regla de las PM).
 PREFIJOS_PRIORITARIOS = ("walmart", "bodega", "sam")
@@ -78,6 +88,38 @@ def sin_acentos_minusculas(texto):
         return ""
     nfkd = unicodedata.normalize("NFKD", str(texto))
     return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
+
+
+def clave_opcion(texto):
+    """Clave para comparar dos opciones y detectar duplicados.
+
+    Ignora mayúsculas/minúsculas, acentos y los espacios sobrantes (al
+    principio, al final y los repetidos en medio). Así « ciudad  de MEXICO »
+    y "Ciudad de México" se reconocen como la misma opción.
+    """
+    return sin_acentos_minusculas(limpiar_texto(texto) or "")
+
+
+def combinar_opciones(*listas):
+    """Une varias listas de opciones sin duplicados.
+
+    Conserva el orden de aparición y la primera forma escrita de cada opción
+    (la de la lista base, cuando existe ahí). La comparación usa
+    `clave_opcion`, así que no se cuelan variantes que solo cambian en
+    mayúsculas, acentos o espacios.
+    """
+    vistas, resultado = set(), []
+    for lista in listas:
+        for valor in lista or []:
+            limpio = limpiar_texto(valor)
+            if not limpio:
+                continue
+            clave = clave_opcion(limpio)
+            if clave in vistas:
+                continue
+            vistas.add(clave)
+            resultado.append(limpio)
+    return resultado
 
 
 def normalizar_frecuencia(texto_original):

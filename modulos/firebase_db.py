@@ -35,6 +35,10 @@ Colecciones en Firestore:
                          fecha, cliente_id, cliente, categoria, estado,
                          frecuencia, cobro_por_recoleccion, es_prioritario,
                          tipo_servicio, responsable, evidencias[], creado_en }
+    catalogos          un documento por catálogo ampliable (categorias,
+                       estados, frecuencias) con { valores: [...] }: las
+                       opciones que se agregaron desde el formulario de
+                       clientes, además de las de fábrica de utilidades.py
 
 Nota de diseño: en las incidencias se DENORMALIZAN algunos campos del
 servicio (fecha, cliente, estado...). En Firestore no existen los JOIN de
@@ -51,11 +55,16 @@ from urllib.parse import quote
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
+from modulos import utilidades as ut
+
 # Nombres de las colecciones
 COL_CLIENTES = "clientes"
 COL_TIPOS = "tipos_incidencia"
 COL_SERVICIOS = "servicios"
 COL_INCIDENCIAS = "incidencias"
+# Opciones que el usuario agrega a los catálogos de categoría, estado y
+# frecuencia. Un documento por catálogo, con un arreglo `valores`.
+COL_CATALOGOS = "catalogos"
 
 _app = None
 _db = None
@@ -148,11 +157,110 @@ def crear_cliente(datos):
     return ref.id
 
 
-def existe_cliente_con_nombre(nombre):
-    consulta = (db().collection(COL_CLIENTES)
-                .where(filter=firestore.FieldFilter("nombre", "==", nombre))
-                .limit(1).stream())
-    return any(True for _ in consulta)
+def existe_cliente_con_nombre(nombre, excluir_id=None):
+    """¿Ya hay un cliente con ese nombre?
+
+    La comparación ignora mayúsculas, acentos y espacios sobrantes, así que
+    "walmart norte" y "Walmart  Norte" cuentan como el mismo cliente.
+    `excluir_id` sirve al editar: el propio cliente no se compara consigo mismo.
+    """
+    clave = ut.clave_opcion(nombre)
+    for cliente in listar_clientes():
+        if excluir_id and cliente.get("id") == excluir_id:
+            continue
+        if ut.clave_opcion(cliente.get("nombre")) == clave:
+            return True
+    return False
+
+
+# Campos del cliente que se copian (denormalizan) en servicios e incidencias.
+# Al editar un cliente hay que refrescarlos ahí también, o el dashboard
+# seguiría mostrando el dato viejo.
+def _propagar_cliente(cliente_id, cliente):
+    """Refresca los datos del cliente copiados en servicios e incidencias.
+
+    Devuelve cuántos documentos se actualizaron. Se usan lotes (batch)
+    porque un cliente puede tener muchos servicios.
+    """
+    denormalizado = {
+        "cliente": cliente["nombre"],
+        "categoria": cliente["categoria"],
+        "estado": cliente["estado"],
+        "frecuencia": cliente["frecuencia"],
+        "cobro_por_recoleccion": cliente["cobro_por_recoleccion"],
+    }
+    base = db()
+    total = 0
+
+    for coleccion in (COL_SERVICIOS, COL_INCIDENCIAS):
+        cambios = dict(denormalizado)
+        if coleccion == COL_INCIDENCIAS:
+            # En incidencias, «prioritario» sale del cobro por recolección
+            cambios["es_prioritario"] = cliente["cobro_por_recoleccion"]
+
+        documentos = (base.collection(coleccion)
+                      .where(filter=firestore.FieldFilter("cliente_id", "==", cliente_id))
+                      .stream())
+
+        lote, en_lote = base.batch(), 0
+        for doc in documentos:
+            lote.update(doc.reference, cambios)
+            en_lote += 1
+            total += 1
+            if en_lote >= 400:          # Firestore permite hasta 500 por lote
+                lote.commit()
+                lote, en_lote = base.batch(), 0
+        if en_lote:
+            lote.commit()
+
+    return total
+
+
+def actualizar_cliente(cliente_id, datos):
+    """Corrige los datos de un cliente ya registrado.
+
+    Los campos que no vengan en `datos` conservan su valor anterior. Devuelve
+    cuántos servicios e incidencias se refrescaron con los datos nuevos.
+    """
+    ref = db().collection(COL_CLIENTES).document(cliente_id)
+    documento = ref.get()
+    if not documento.exists:
+        raise ValueError("El cliente indicado no existe.")
+    previo = documento.to_dict() or {}
+
+    activo = bool(datos.get("activo", previo.get("activo", True)))
+    cambios = {
+        "nombre": datos["nombre"],
+        "categoria": datos.get("categoria") or previo.get("categoria", "Empresa"),
+        "estado": datos.get("estado") or previo.get("estado", "Ciudad de México"),
+        "frecuencia": datos.get("frecuencia") or previo.get("frecuencia", "Mensual"),
+        "activo": activo,
+        "cobro_por_recoleccion": bool(datos.get("cobro_por_recoleccion", False)),
+        "estatus": "Activo" if activo else "Sin recolecciones",
+    }
+    # `frecuencia_original` guarda lo que decía el Excel de origen: es un dato
+    # histórico y no se toca al editar.
+    ref.update(cambios)
+    return _propagar_cliente(cliente_id, cambios)
+
+
+# ---------------------------------------------------------------------------
+# Catálogos ampliables (categorías, estados y frecuencias)
+# ---------------------------------------------------------------------------
+def listar_opciones_catalogo(nombre):
+    """Opciones que se han agregado a mano a un catálogo. Las de fábrica
+    viven en utilidades.OPCIONES_BASE; estas se suman a aquellas."""
+    doc = db().collection(COL_CATALOGOS).document(nombre).get()
+    if not doc.exists:
+        return []
+    return list((doc.to_dict() or {}).get("valores") or [])
+
+
+def agregar_opcion_catalogo(nombre, valor):
+    """Guarda una opción nueva para que esté disponible en futuros registros.
+    Quien llama ya verificó que no esté duplicada."""
+    (db().collection(COL_CATALOGOS).document(nombre)
+     .set({"valores": firestore.ArrayUnion([valor])}, merge=True))
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +344,16 @@ def listar_incidencias():
                   reverse=True)
 
 
-def crear_incidencia(datos):
-    """Crea una incidencia asociada a un servicio, denormalizando los datos
-    del servicio y del tipo para que el dashboard lea una sola colección."""
+def _entero(valor):
+    try:
+        return max(0, int(valor))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _servicio_y_tipo(datos):
+    """Comprueba que el servicio y el tipo existan y los devuelve.
+    Es lo que se denormaliza dentro de la incidencia."""
     servicio = obtener_servicio(datos["servicio_id"])
     if servicio is None:
         raise ValueError("El servicio indicado no existe.")
@@ -246,18 +361,18 @@ def crear_incidencia(datos):
     tipo_doc = db().collection(COL_TIPOS).document(datos["tipo_incidencia_id"]).get()
     if not tipo_doc.exists:
         raise ValueError("El tipo de incidencia indicado no existe.")
-    tipo = tipo_doc.to_dict()
+    return servicio, tipo_doc.to_dict()
 
+
+def _documento_incidencia(datos, servicio, tipo):
+    """Campos de una incidencia a partir de lo capturado en el formulario.
+
+    Lo usan tanto el alta como la edición, para que una incidencia corregida
+    quede exactamente igual que si se hubiera capturado bien desde el inicio.
+    No incluye `creado_en` ni `evidencias`: esos solo se fijan al crearla.
+    """
     resuelta = bool(datos.get("resuelta", False))
-
-    def _entero(valor):
-        try:
-            return max(0, int(valor))
-        except (TypeError, ValueError):
-            return 0
-
-    ref = db().collection(COL_INCIDENCIAS).document()
-    ref.set({
+    return {
         "servicio_id": datos["servicio_id"],
         "tipo_incidencia_id": datos["tipo_incidencia_id"],
         "tipo_incidencia": tipo.get("nombre"),          # denormalizado
@@ -288,10 +403,44 @@ def crear_incidencia(datos):
         "es_prioritario": bool(servicio.get("cobro_por_recoleccion")),
         "tipo_servicio": servicio.get("tipo_servicio"),
         "responsable": servicio.get("responsable"),
+    }
+
+
+def crear_incidencia(datos):
+    """Crea una incidencia asociada a un servicio, denormalizando los datos
+    del servicio y del tipo para que el dashboard lea una sola colección."""
+    servicio, tipo = _servicio_y_tipo(datos)
+
+    ref = db().collection(COL_INCIDENCIAS).document()
+    ref.set({
+        **_documento_incidencia(datos, servicio, tipo),
         "evidencias": [],                                # se llenan al subir
         "creado_en": _ahora(),
     })
     return ref.id
+
+
+def obtener_incidencia(incidencia_id):
+    doc = db().collection(COL_INCIDENCIAS).document(incidencia_id).get()
+    return _con_id(doc) if doc.exists else None
+
+
+def actualizar_incidencia(incidencia_id, datos):
+    """Corrige una incidencia ya registrada, sin crear un registro nuevo.
+
+    Se vuelven a copiar los datos del servicio y del tipo, por si se cambió
+    alguno de los dos. Las evidencias ya subidas y la fecha de alta no se
+    tocan: se conservan tal cual.
+    """
+    ref = db().collection(COL_INCIDENCIAS).document(incidencia_id)
+    if not ref.get().exists:
+        raise ValueError("La incidencia indicada no existe.")
+
+    servicio, tipo = _servicio_y_tipo(datos)
+    ref.update({
+        **_documento_incidencia(datos, servicio, tipo),
+        "actualizado_en": _ahora(),
+    })
 
 
 def resolver_incidencia(incidencia_id, fecha_resolucion, a_tiempo, comentario=None):
