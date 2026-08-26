@@ -309,6 +309,15 @@ def post_resolver(incidencia_id):
         return jsonify({"error": str(error)}), 404
     return jsonify({"mensaje": "Incidencia marcada como resuelta."})
 
+@app.delete("/api/incidencias/<incidencia_id>")
+def delete_incidencia(incidencia_id):
+    """Elimina permanentemente una incidencia de prueba."""
+    try:
+        fdb.eliminar_incidencia(incidencia_id)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 404
+        
+    return jsonify({"mensaje": "Incidencia eliminada exitosamente."})
 
 # ---------------------------------------------------------------------------
 # Evidencias (van a Firebase Storage, NO al disco de Render)
