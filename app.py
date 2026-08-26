@@ -310,6 +310,7 @@ def post_resolver(incidencia_id):
     return jsonify({"mensaje": "Incidencia marcada como resuelta."})
 
 @app.delete("/api/incidencias/<incidencia_id>")
+@verificar_token
 def delete_incidencia(incidencia_id):
     """Elimina permanentemente una incidencia de prueba."""
     try:
