@@ -456,6 +456,21 @@ def resolver_incidencia(incidencia_id, fecha_resolucion, a_tiempo, comentario=No
         cambios["comentarios"] = comentario
     ref.update(cambios)
 
+def eliminar_incidencia(incidencia_id):
+    """
+    Borra físicamente el documento de la incidencia en Firestore.
+    """
+    # Intentamos usar una constante si existe, si no, usamos el string 'incidencias'
+    coleccion = globals().get('COL_INCIDENCIAS', 'incidencias')
+    
+    # Referencia al documento
+    doc_ref = db().collection(coleccion).document(incidencia_id)
+    
+    if not doc_ref.get().exists:
+        raise ValueError("La incidencia no existe.")
+
+    doc_ref.delete()
+
 
 # ---------------------------------------------------------------------------
 # Evidencias (Firebase Storage)
